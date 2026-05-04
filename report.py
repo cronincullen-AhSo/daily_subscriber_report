@@ -15,7 +15,7 @@ import base64
 DB_HOST   = os.environ['DB_HOST']
 DB_USER   = os.environ['DB_USER']
 DB_PASS   = os.environ['DB_PASSWORD']
-DB_NAME   = os.environ.get('DB_NAME', 'castability')
+DB_NAME   = os.environ.get('DB_NAME', 'castabilityprod')
 SENDGRID  = os.environ['SENDGRID_API_KEY']
 RC_KEY    = os.environ['REVENUE_CAT_API_KEY']
 RECIPIENT = os.environ.get('REPORT_RECIPIENT', 'taylor.shurte@castability.actor')
@@ -32,44 +32,64 @@ conn = pymysql.connect(
 )
 cur = conn.cursor()
 
+# New profiles in last 24hrs
 cur.execute("""
-    SELECT a.id AS actor_id, u.first_name, u.last_name, u.email,
-           a.has_external_subscription, u.subscriber_id, a.created_at
-    FROM actors a
-    JOIN users u ON u.actor_id = a.id
-    WHERE a.created_at >= %s
-    ORDER BY a.id ASC
+    SELECT
+        pa.id         AS actor_id,
+        pa.firstName  AS first_name,
+        pa.lastName   AS last_name,
+        u.email,
+        pa.userId,
+        pa.createdAt
+    FROM ProfileActors pa
+    JOIN Users u ON u.id = pa.userId
+    WHERE pa.createdAt >= %s
+    ORDER BY pa.createdAt ASC
 """, (since,))
 new_actors = cur.fetchall()
 
+# New orders/subscriptions in last 24hrs from existing users
 cur.execute("""
-    SELECT a.id AS actor_id, u.first_name, u.last_name, u.email,
-           u.subscriber_id, a.updated_at
-    FROM actors a
-    JOIN users u ON u.actor_id = a.id
-    WHERE a.has_external_subscription = 1
-      AND a.updated_at >= %s
-      AND a.created_at < %s
-    ORDER BY a.id ASC
+    SELECT
+        oh.userId,
+        pa.id        AS actor_id,
+        pa.firstName AS first_name,
+        pa.lastName  AS last_name,
+        u.email,
+        oh.productId,
+        oh.status,
+        oh.createdAt
+    FROM OrderHistories oh
+    JOIN Users u ON u.id = oh.userId
+    JOIN ProfileActors pa ON pa.userId = oh.userId
+    WHERE oh.createdAt >= %s
+      AND oh.status = 'success'
+      AND pa.createdAt < %s
+    ORDER BY oh.createdAt ASC
 """, (since, since))
-conversions = cur.fetchall()
+new_orders = cur.fetchall()
 
-cur.execute("SELECT MAX(id) FROM actors")
-max_actor_id = list(cur.fetchone().values())[0] or 0
+# ID range for deduction
+cur.execute("SELECT MAX(id) FROM ProfileActors")
+max_id_row = cur.fetchone()
+max_actor_id = list(max_id_row.values())[0] or 'N/A'
 
-cur.execute("SELECT MAX(id) FROM actors WHERE created_at < %s", (since,))
-prev_max_actor_id = list(cur.fetchone().values())[0] or 0
+cur.execute("SELECT COUNT(*) as cnt FROM ProfileActors WHERE createdAt < %s", (since,))
+prev_count = list(cur.fetchone().values())[0] or 0
+
+cur.execute("SELECT COUNT(*) as cnt FROM ProfileActors", )
+total_count = list(cur.fetchone().values())[0] or 0
 
 cur.close()
 conn.close()
 
 # RevenueCat enrichment
-def get_rc(sid):
-    if not sid:
+def get_rc(user_id):
+    if not user_id:
         return None
     try:
         req = urllib.request.Request(
-            f"https://api.revenuecat.com/v1/subscribers/{sid}",
+            f"https://api.revenuecat.com/v1/subscribers/{user_id}",
             headers={'Authorization': f'Bearer {RC_KEY}', 'Content-Type': 'application/json'}
         )
         with urllib.request.urlopen(req, timeout=5) as r:
@@ -106,40 +126,38 @@ def rc_expires(rc):
 # Build rows
 rows = []
 for a in new_actors:
-    rc = get_rc(a['subscriber_id'])
-    t = rc_type(rc) or ('Subscriber (DB)' if a['has_external_subscription'] else 'Trial / Free')
-    rows.append([a['actor_id'], a['first_name'], a['last_name'], a['email'], t,
-                 rc_product(rc), rc_expires(rc),
-                 a['created_at'].strftime('%Y-%m-%d %H:%M UTC') if a['created_at'] else ''])
+    rc = get_rc(a['userId'])
+    t = rc_type(rc) or 'New Profile'
+    rows.append([
+        a['actor_id'], a['first_name'], a['last_name'], a['email'],
+        t, rc_product(rc), rc_expires(rc),
+        a['createdAt'].strftime('%Y-%m-%d %H:%M UTC') if a['createdAt'] else ''
+    ])
 
-for a in conversions:
-    rc = get_rc(a['subscriber_id'])
-    t = rc_type(rc) or 'Converted to Subscriber (DB)'
-    rows.append([a['actor_id'], a['first_name'], a['last_name'], a['email'], t,
-                 rc_product(rc), rc_expires(rc),
-                 a['updated_at'].strftime('%Y-%m-%d %H:%M UTC') if a['updated_at'] else ''])
+seen_user_ids = {a['userId'] for a in new_actors}
+for o in new_orders:
+    if o['userId'] in seen_user_ids:
+        continue
+    rc = get_rc(o['userId'])
+    t = rc_type(rc) or f"New Order ({o['productId']})"
+    rows.append([
+        o['actor_id'], o['first_name'], o['last_name'], o['email'],
+        t, rc_product(rc), rc_expires(rc),
+        o['createdAt'].strftime('%Y-%m-%d %H:%M UTC') if o['createdAt'] else ''
+    ])
 
-n    = len(new_actors)
-s    = len(conversions)
-gap  = max_actor_id - prev_max_actor_id
-disc = gap - n
-idr  = f"{new_actors[0]['actor_id']}-{new_actors[-1]['actor_id']}" if new_actors else 'none today'
-
-if disc == 0:
-    conf = 'HIGH'
-elif abs(disc) <= 2:
-    conf = 'HIGH (minor rounding)'
-elif abs(disc) <= 5:
-    conf = 'MEDIUM'
-else:
-    conf = 'LOW - please check'
-
-diff = 'None - exact match' if disc == 0 else f'{abs(disc)} {"missing from report" if disc > 0 else "extra in report"}'
+n          = len(new_actors)
+s          = len(new_orders)
+gap        = total_count - prev_count
+disc       = gap - n
+confidence = 'HIGH' if abs(disc) <= 2 else ('MEDIUM' if abs(disc) <= 5 else 'LOW - please check')
+diff       = 'None - exact match' if disc == 0 else f'{abs(disc)} {"missing" if disc > 0 else "extra"}'
 
 # CSV
 buf = io.StringIO()
 w = csv.writer(buf)
-w.writerow(['Actor ID', 'First Name', 'Last Name', 'Email', 'Type', 'RC Product', 'Subscription Expires', 'Timestamp (UTC)'])
+w.writerow(['Actor ID', 'First Name', 'Last Name', 'Email',
+            'Type', 'RC Product', 'Subscription Expires', 'Timestamp (UTC)'])
 for r in rows:
     w.writerow(r)
 csv_data = buf.getvalue()
@@ -148,22 +166,21 @@ csv_data = buf.getvalue()
 if disc > 2:
     check = f"""<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:4px;padding:10px 14px;font-size:13px;margin-top:8px;">
       <strong>Taylor - please double-check this.</strong><br><br>
-      ID gap says <strong>{gap} new signups</strong> today but report captured <strong>{n}</strong>. Difference: <strong>{disc}</strong>.<br><br>
+      Profile count increased by <strong>{gap}</strong> today but report captured <strong>{n}</strong> new profiles. Difference: <strong>{disc}</strong>.<br><br>
       <strong>How to check (30 seconds):</strong>
       <ol style="margin:8px 0 0 0;padding-left:18px;line-height:1.8;">
         <li>Go to <a href="https://castability.gojilabs.app/admin/actors">castability.gojilabs.app/admin/actors</a></li>
-        <li>Sort by Date Created - newest first</li>
-        <li>Look for Actor IDs between <strong>{prev_max_actor_id}</strong> and <strong>{max_actor_id}</strong></li>
-        <li>Any IDs in that range not in the CSV are the missing ones</li>
+        <li>Sort by "Date Created" - newest first</li>
+        <li>Check anyone created today not in the CSV</li>
       </ol><br>
-      Most likely: incomplete profile, test account, or deleted signup. Flag to Cronin if something looks off.
+      Most likely: incomplete profile or test account. Flag to Cronin if something looks off.
     </div>"""
 elif disc == 0:
     check = '<p style="margin:8px 0 0 0;font-size:13px;color:#2e7d32;"><strong>Numbers match exactly.</strong> CSV has everything.</p>'
 else:
     check = f'<p style="margin:8px 0 0 0;font-size:13px;color:#e65100;"><strong>Small difference of {abs(disc)}.</strong> Likely a test account. Probably fine.</p>'
 
-# HTML email
+# HTML
 html = f"""<!DOCTYPE html>
 <html>
 <body style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;padding:24px;color:#222;">
@@ -171,27 +188,30 @@ html = f"""<!DOCTYPE html>
   <p style="color:#666;margin-top:0;">{date_str}</p>
   <table style="background:#f5f5f5;border-radius:8px;padding:16px;width:100%;margin-bottom:24px;border-collapse:collapse;">
     <tr><td style="padding:6px 16px 6px 0;color:#666;font-size:14px;">New profiles today</td><td style="font-size:14px;"><strong>{n}</strong></td></tr>
-    <tr><td style="padding:6px 16px 6px 0;color:#666;font-size:14px;">New subscribers / conversions today</td><td style="font-size:14px;"><strong>{s}</strong></td></tr>
-    <tr><td style="padding:6px 16px 6px 0;color:#666;font-size:14px;">New Actor ID range today</td><td style="font-size:14px;"><strong>{idr}</strong></td></tr>
-    <tr><td style="padding:6px 16px 6px 0;color:#666;font-size:14px;">Highest Actor ID on platform right now</td><td style="font-size:14px;"><strong>{max_actor_id}</strong></td></tr>
-    <tr><td style="padding:6px 16px 6px 0;color:#666;font-size:14px;">Yesterday's highest Actor ID</td><td style="font-size:14px;"><strong>{prev_max_actor_id}</strong></td></tr>
+    <tr><td style="padding:6px 16px 6px 0;color:#666;font-size:14px;">New orders / conversions today</td><td style="font-size:14px;"><strong>{s}</strong></td></tr>
+    <tr><td style="padding:6px 16px 6px 0;color:#666;font-size:14px;">Total platform profiles</td><td style="font-size:14px;"><strong>{total_count}</strong></td></tr>
+    <tr><td style="padding:6px 16px 6px 0;color:#666;font-size:14px;">Profile count growth today</td><td style="font-size:14px;"><strong>{gap}</strong></td></tr>
   </table>
   <div style="background:#fff8e1;border-left:4px solid #f5a623;padding:16px 20px;border-radius:4px;margin-bottom:24px;">
     <p style="margin:0 0 8px 0;font-weight:bold;font-size:15px;">What this tells us - read this first</p>
-    <p style="margin:0 0 10px 0;font-size:14px;line-height:1.6;">Actor IDs are assigned in order like ticket numbers. The CSV includes RevenueCat data where available - RC Product shows the subscription plan, Subscription Expires shows the renewal date. Type shows the source: (RC) = confirmed by RevenueCat, (DB) = from our database only.</p>
+    <p style="margin:0 0 10px 0;font-size:14px;line-height:1.6;">
+      Profile count grew by {gap} today. This report captured {n} new profiles directly.
+      The CSV includes RevenueCat data where available - RC Product shows the subscription plan,
+      Subscription Expires shows the renewal date.
+    </p>
     <table style="border-collapse:collapse;width:100%;font-size:14px;margin-bottom:10px;">
-      <tr><td style="padding:4px 12px 4px 0;color:#555;">Highest ID yesterday</td><td><strong>{prev_max_actor_id}</strong></td></tr>
-      <tr><td style="padding:4px 12px 4px 0;color:#555;">Highest ID today</td><td><strong>{max_actor_id}</strong></td></tr>
-      <tr style="border-top:1px solid #ddd;"><td style="padding:6px 12px 6px 0;color:#555;">ID gap (estimated new signups)</td><td><strong>{gap}</strong></td></tr>
-      <tr><td style="padding:4px 12px 4px 0;color:#555;">Profiles captured in this report</td><td><strong>{n}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#555;">Profile count yesterday</td><td><strong>{prev_count}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#555;">Profile count today</td><td><strong>{total_count}</strong></td></tr>
+      <tr style="border-top:1px solid #ddd;"><td style="padding:6px 12px 6px 0;color:#555;">Growth</td><td><strong>{gap}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#555;">Captured in report</td><td><strong>{n}</strong></td></tr>
       <tr><td style="padding:4px 12px 4px 0;color:#555;">Difference</td><td><strong>{diff}</strong></td></tr>
-      <tr style="border-top:1px solid #ddd;"><td style="padding:6px 12px 6px 0;color:#555;font-weight:bold;">Confidence rating</td><td style="font-weight:bold;">{conf}</td></tr>
+      <tr style="border-top:1px solid #ddd;"><td style="padding:6px 12px 6px 0;color:#555;font-weight:bold;">Confidence</td><td style="font-weight:bold;">{confidence}</td></tr>
     </table>
     {check}
   </div>
-  <p style="font-size:14px;margin-bottom:4px;"><strong>Attached CSV</strong> - Actor ID, name, email, subscription type, RC product, expiry, signup time. Sort by Actor ID to see in order.</p>
+  <p style="font-size:14px;margin-bottom:4px;"><strong>Attached CSV</strong> - name, email, type, RC product, expiry, signup time. All new profiles and orders from the last 24 hours.</p>
   <hr style="border:none;border-top:1px solid #eee;margin:24px 0;">
-  <p style="font-size:11px;color:#aaa;margin:0;">Sent automatically at 7am PT - Platform max Actor ID: {max_actor_id} - Questions? Contact Cronin.</p>
+  <p style="font-size:11px;color:#aaa;margin:0;">Sent automatically at 7am PT - Total profiles: {total_count} - Questions? Contact Cronin.</p>
 </body>
 </html>"""
 
@@ -207,4 +227,4 @@ message.attachment = Attachment(
     FileName(filename), FileType('text/csv'), Disposition('attachment')
 )
 response = SendGridAPIClient(SENDGRID).send(message)
-print(f"Sent {len(rows)} records to {RECIPIENT} | Status: {response.status_code} | IDs: {idr} | Max: {max_actor_id}")
+print(f"Sent {len(rows)} records to {RECIPIENT} | Status: {response.status_code} | New profiles: {n} | Total: {total_count}")
