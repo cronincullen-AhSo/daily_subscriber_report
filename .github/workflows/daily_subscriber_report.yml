@@ -6,20 +6,21 @@ on:
   workflow_dispatch:
 
 jobs:
-  subscriber_report:
+  report:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Ruby
-        uses: ruby/setup-ruby@v1
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          ruby-version: '3.4.4'
-          bundler-cache: true
-          working-directory: api
-      - name: Run daily subscriber report
-        working-directory: api
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install psycopg2-binary sendgrid
+      - name: Run report
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          REVENUE_CAT_API_KEY: ${{ secrets.REVENUE_CAT_API_KEY }}
           REPORT_RECIPIENT: taylor.shurte@castability.actor
-        run: bundle exec rake reports:daily_subscribers
+          REPORT_SENDER: cronin.cullen@castability.actor
+        run: python report.py
