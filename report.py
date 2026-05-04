@@ -7,7 +7,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import (
-    Mail, Attachment, FileContent, FileName, FileType, Disposition
+    Mail, Attachment, FileContent, FileName, FileType, Disposition, Cc
 )
 import base64
 
@@ -19,11 +19,13 @@ DB_NAME   = os.environ.get('DB_NAME', 'castabilityprod')
 SENDGRID  = os.environ['SENDGRID_API_KEY']
 RC_KEY    = os.environ['REVENUE_CAT_API_KEY']
 RECIPIENT = os.environ.get('REPORT_RECIPIENT', 'taylor.shurte@castability.actor')
+CC        = os.environ.get('REPORT_CC',        'cronin.cullen@castability.actor')
 SENDER    = os.environ.get('REPORT_SENDER',    'cronin.cullen@castability.actor')
 
-now      = datetime.now(timezone.utc)
-since    = now - timedelta(hours=24)
-date_str = now.strftime('%B %-d, %Y')
+now       = datetime.now(timezone.utc)
+since     = now - timedelta(hours=24)
+two_weeks = now - timedelta(days=14)
+date_str  = now.strftime('%B %-d, %Y')
 
 # DB Query
 conn = pymysql.connect(
@@ -34,13 +36,8 @@ cur = conn.cursor()
 
 # New profiles in last 24hrs
 cur.execute("""
-    SELECT
-        pa.id         AS actor_id,
-        pa.firstName  AS first_name,
-        pa.lastName   AS last_name,
-        u.email,
-        pa.userId,
-        pa.createdAt
+    SELECT pa.id AS actor_id, pa.firstName AS first_name, pa.lastName AS last_name,
+           u.email, pa.userId, pa.createdAt
     FROM ProfileActors pa
     JOIN Users u ON u.id = pa.userId
     WHERE pa.createdAt >= %s
@@ -48,37 +45,41 @@ cur.execute("""
 """, (since,))
 new_actors = cur.fetchall()
 
-# New orders/subscriptions in last 24hrs from existing users
+# New orders in last 24hrs from existing users
 cur.execute("""
-    SELECT
-        oh.userId,
-        pa.id        AS actor_id,
-        pa.firstName AS first_name,
-        pa.lastName  AS last_name,
-        u.email,
-        oh.productId,
-        oh.status,
-        oh.createdAt
+    SELECT oh.userId, pa.id AS actor_id, pa.firstName AS first_name,
+           pa.lastName AS last_name, u.email, oh.productId, oh.status, oh.createdAt
     FROM OrderHistories oh
     JOIN Users u ON u.id = oh.userId
     JOIN ProfileActors pa ON pa.userId = oh.userId
-    WHERE oh.createdAt >= %s
-      AND oh.status = 'success'
-      AND pa.createdAt < %s
+    WHERE oh.createdAt >= %s AND oh.status = 'success' AND pa.createdAt < %s
     ORDER BY oh.createdAt ASC
 """, (since, since))
 new_orders = cur.fetchall()
 
-# ID range for deduction
-cur.execute("SELECT MAX(id) FROM ProfileActors")
-max_id_row = cur.fetchone()
-max_actor_id = list(max_id_row.values())[0] or 'N/A'
-
+# Totals for deduction math
 cur.execute("SELECT COUNT(*) as cnt FROM ProfileActors WHERE createdAt < %s", (since,))
 prev_count = list(cur.fetchone().values())[0] or 0
 
-cur.execute("SELECT COUNT(*) as cnt FROM ProfileActors", )
+cur.execute("SELECT COUNT(*) as cnt FROM ProfileActors")
 total_count = list(cur.fetchone().values())[0] or 0
+
+# Two-week trend — daily signup counts
+cur.execute("""
+    SELECT DATE(createdAt) as day, COUNT(*) as cnt
+    FROM ProfileActors
+    WHERE createdAt >= %s
+    GROUP BY DATE(createdAt)
+    ORDER BY day ASC
+""", (two_weeks,))
+daily_trend = cur.fetchall()
+
+# Two-week totals
+cur.execute("SELECT COUNT(*) as cnt FROM ProfileActors WHERE createdAt >= %s", (two_weeks,))
+two_week_total = list(cur.fetchone().values())[0] or 0
+
+cur.execute("SELECT COUNT(*) as cnt FROM OrderHistories WHERE createdAt >= %s AND status = 'success'", (two_weeks,))
+two_week_orders = list(cur.fetchone().values())[0] or 0
 
 cur.close()
 conn.close()
@@ -128,30 +129,33 @@ rows = []
 for a in new_actors:
     rc = get_rc(a['userId'])
     t = rc_type(rc) or 'New Profile'
-    rows.append([
-        a['actor_id'], a['first_name'], a['last_name'], a['email'],
-        t, rc_product(rc), rc_expires(rc),
-        a['createdAt'].strftime('%Y-%m-%d %H:%M UTC') if a['createdAt'] else ''
-    ])
+    rows.append([a['actor_id'], a['first_name'], a['last_name'], a['email'],
+                 t, rc_product(rc), rc_expires(rc),
+                 a['createdAt'].strftime('%Y-%m-%d %H:%M UTC') if a['createdAt'] else ''])
 
-seen_user_ids = {a['userId'] for a in new_actors}
+seen = {a['userId'] for a in new_actors}
 for o in new_orders:
-    if o['userId'] in seen_user_ids:
+    if o['userId'] in seen:
         continue
     rc = get_rc(o['userId'])
     t = rc_type(rc) or f"New Order ({o['productId']})"
-    rows.append([
-        o['actor_id'], o['first_name'], o['last_name'], o['email'],
-        t, rc_product(rc), rc_expires(rc),
-        o['createdAt'].strftime('%Y-%m-%d %H:%M UTC') if o['createdAt'] else ''
-    ])
+    rows.append([o['actor_id'], o['first_name'], o['last_name'], o['email'],
+                 t, rc_product(rc), rc_expires(rc),
+                 o['createdAt'].strftime('%Y-%m-%d %H:%M UTC') if o['createdAt'] else ''])
 
-n          = len(new_actors)
-s          = len(new_orders)
-gap        = total_count - prev_count
-disc       = gap - n
-confidence = 'HIGH' if abs(disc) <= 2 else ('MEDIUM' if abs(disc) <= 5 else 'LOW - please check')
-diff       = 'None - exact match' if disc == 0 else f'{abs(disc)} {"missing" if disc > 0 else "extra"}'
+n    = len(new_actors)
+s    = len(new_orders)
+gap  = total_count - prev_count
+disc = gap - n
+conf = 'HIGH' if abs(disc) <= 2 else ('MEDIUM' if abs(disc) <= 5 else 'LOW - please check')
+diff = 'None - exact match' if disc == 0 else f'{abs(disc)} {"missing" if disc > 0 else "extra"}'
+
+# Two-week trend table rows
+trend_rows = ''.join([
+    f'<tr><td style="padding:4px 12px 4px 0;color:#555;">{str(row["day"])}</td><td><strong>{row["cnt"]}</strong></td></tr>'
+    for row in daily_trend
+])
+avg_daily = round(two_week_total / 14, 1)
 
 # CSV
 buf = io.StringIO()
@@ -166,7 +170,7 @@ csv_data = buf.getvalue()
 if disc > 2:
     check = f"""<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:4px;padding:10px 14px;font-size:13px;margin-top:8px;">
       <strong>Taylor - please double-check this.</strong><br><br>
-      Profile count increased by <strong>{gap}</strong> today but report captured <strong>{n}</strong> new profiles. Difference: <strong>{disc}</strong>.<br><br>
+      Profile count grew by <strong>{gap}</strong> today but report captured <strong>{n}</strong>. Difference: <strong>{disc}</strong>.<br><br>
       <strong>How to check (30 seconds):</strong>
       <ol style="margin:8px 0 0 0;padding-left:18px;line-height:1.8;">
         <li>Go to <a href="https://castability.gojilabs.app/admin/actors">castability.gojilabs.app/admin/actors</a></li>
@@ -186,29 +190,41 @@ html = f"""<!DOCTYPE html>
 <body style="font-family:Arial,sans-serif;max-width:640px;margin:0 auto;padding:24px;color:#222;">
   <h2 style="margin-bottom:4px;">Castability - Daily Signups Report</h2>
   <p style="color:#666;margin-top:0;">{date_str}</p>
+
   <table style="background:#f5f5f5;border-radius:8px;padding:16px;width:100%;margin-bottom:24px;border-collapse:collapse;">
     <tr><td style="padding:6px 16px 6px 0;color:#666;font-size:14px;">New profiles today</td><td style="font-size:14px;"><strong>{n}</strong></td></tr>
     <tr><td style="padding:6px 16px 6px 0;color:#666;font-size:14px;">New orders / conversions today</td><td style="font-size:14px;"><strong>{s}</strong></td></tr>
     <tr><td style="padding:6px 16px 6px 0;color:#666;font-size:14px;">Total platform profiles</td><td style="font-size:14px;"><strong>{total_count}</strong></td></tr>
     <tr><td style="padding:6px 16px 6px 0;color:#666;font-size:14px;">Profile count growth today</td><td style="font-size:14px;"><strong>{gap}</strong></td></tr>
   </table>
+
   <div style="background:#fff8e1;border-left:4px solid #f5a623;padding:16px 20px;border-radius:4px;margin-bottom:24px;">
     <p style="margin:0 0 8px 0;font-weight:bold;font-size:15px;">What this tells us - read this first</p>
-    <p style="margin:0 0 10px 0;font-size:14px;line-height:1.6;">
-      Profile count grew by {gap} today. This report captured {n} new profiles directly.
-      The CSV includes RevenueCat data where available - RC Product shows the subscription plan,
-      Subscription Expires shows the renewal date.
-    </p>
+    <p style="margin:0 0 10px 0;font-size:14px;line-height:1.6;">Profile count grew by {gap} today. This report captured {n} new profiles. The CSV includes RevenueCat data where available.</p>
     <table style="border-collapse:collapse;width:100%;font-size:14px;margin-bottom:10px;">
       <tr><td style="padding:4px 12px 4px 0;color:#555;">Profile count yesterday</td><td><strong>{prev_count}</strong></td></tr>
       <tr><td style="padding:4px 12px 4px 0;color:#555;">Profile count today</td><td><strong>{total_count}</strong></td></tr>
       <tr style="border-top:1px solid #ddd;"><td style="padding:6px 12px 6px 0;color:#555;">Growth</td><td><strong>{gap}</strong></td></tr>
       <tr><td style="padding:4px 12px 4px 0;color:#555;">Captured in report</td><td><strong>{n}</strong></td></tr>
       <tr><td style="padding:4px 12px 4px 0;color:#555;">Difference</td><td><strong>{diff}</strong></td></tr>
-      <tr style="border-top:1px solid #ddd;"><td style="padding:6px 12px 6px 0;color:#555;font-weight:bold;">Confidence</td><td style="font-weight:bold;">{confidence}</td></tr>
+      <tr style="border-top:1px solid #ddd;"><td style="padding:6px 12px 6px 0;color:#555;font-weight:bold;">Confidence</td><td style="font-weight:bold;">{conf}</td></tr>
     </table>
     {check}
   </div>
+
+  <div style="background:#f0f7ff;border-left:4px solid #4a90d9;padding:16px 20px;border-radius:4px;margin-bottom:24px;">
+    <p style="margin:0 0 8px 0;font-weight:bold;font-size:15px;">Last 14 Days - Signup Snapshot</p>
+    <table style="border-collapse:collapse;width:100%;font-size:14px;margin-bottom:10px;">
+      <tr><td style="padding:4px 12px 4px 0;color:#555;">Total new profiles (14 days)</td><td><strong>{two_week_total}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#555;">Total successful orders (14 days)</td><td><strong>{two_week_orders}</strong></td></tr>
+      <tr style="border-top:1px solid #ddd;"><td style="padding:6px 12px 6px 0;color:#555;">Average signups per day</td><td><strong>{avg_daily}</strong></td></tr>
+    </table>
+    <p style="margin:8px 0 4px 0;font-size:13px;color:#555;font-weight:bold;">Daily breakdown:</p>
+    <table style="border-collapse:collapse;width:100%;font-size:13px;">
+      {trend_rows}
+    </table>
+  </div>
+
   <p style="font-size:14px;margin-bottom:4px;"><strong>Attached CSV</strong> - name, email, type, RC product, expiry, signup time. All new profiles and orders from the last 24 hours.</p>
   <hr style="border:none;border-top:1px solid #eee;margin:24px 0;">
   <p style="font-size:11px;color:#aaa;margin:0;">Sent automatically at 7am PT - Total profiles: {total_count} - Questions? Contact Cronin.</p>
@@ -218,13 +234,15 @@ html = f"""<!DOCTYPE html>
 # Send
 filename = f"castability_signups_{now.strftime('%Y-%m-%d')}.csv"
 message = Mail(
-    from_email=SENDER, to_emails=RECIPIENT,
+    from_email=SENDER,
+    to_emails=RECIPIENT,
     subject=f"Castability - New Signups {date_str} ({len(rows)})",
     html_content=html
 )
+message.cc = [Cc(CC)]
 message.attachment = Attachment(
     FileContent(base64.b64encode(csv_data.encode()).decode()),
     FileName(filename), FileType('text/csv'), Disposition('attachment')
 )
 response = SendGridAPIClient(SENDGRID).send(message)
-print(f"Sent {len(rows)} records to {RECIPIENT} | Status: {response.status_code} | New profiles: {n} | Total: {total_count}")
+print(f"Sent {len(rows)} records to {RECIPIENT} (CC: {CC}) | Status: {response.status_code} | New profiles: {n} | 14-day total: {two_week_total}")
