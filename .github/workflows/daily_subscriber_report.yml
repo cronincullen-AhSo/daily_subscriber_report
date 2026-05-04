@@ -1,0 +1,25 @@
+name: Daily Subscriber Report
+
+on:
+  schedule:
+    - cron: '0 14 * * *'
+  workflow_dispatch:
+
+jobs:
+  subscriber_report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4.4'
+          bundler-cache: true
+          working-directory: api
+      - name: Run daily subscriber report
+        working-directory: api
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          REPORT_RECIPIENT: taylor.shurte@castability.actor
+        run: bundle exec rake reports:daily_subscribers
